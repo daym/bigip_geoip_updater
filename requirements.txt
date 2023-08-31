@@ -1,0 +1,6 @@
+docopt
+paramiko
+PyOTP
+requests
+scp
+selenium

@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+# bigip_geoip_updater - Download GeoIP updates from f5.com and install them on a Big-IP.
+# Copyright (C) 2023 Danny Milosavljevic
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""
+Usage:
+    bigip_geoip_updater --host=<host> --username=<username> [--password=<password>] --bigip-version=<bigip-version> --myf5-username=<myf5-username> --myf5-password-file=<myf5-password-file> --myf5-totp-file=<myf5-totp-file>
+    
+    This script downloads GeoIP update files from my.f5.com and installs them on a BIG-IP.
+    
+    --host                  The IP address or hostname of the BIG-IP.
+    --username              The username to use when connecting to the BIG-IP.
+    --password              The password to use when connecting to the BIG-IP.If not specified other means (e.g. SSH keys, Kerberos) will be used to authenticate. (optional)
+    # --myf5-username       The username to use when logging into my.f5.com.
+    # --myf5-password-file  A file containing the password to use when logging into my.f5.com.
+    # --myf5-totp-file      A file containing the TOTP secret to use when logging into my.f5.com.
+"""
+
+import logging
+import os
+import shutil
+import sys
+import tempfile
+import zipfile
+from glob import glob
+
+import paramiko
+import pyotp
+import requests
+from docopt import docopt
+from scp import SCPClient
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+
+def get_geoip_url(myf5_username, myf5_password, myf5_totp, bigip_version):
+    """
+    Get the URL for the GeoIP zip file from my.f5.com.
+    """
+
+    # Login to my.f5.com
+
+    driver = webdriver.Chrome()
+    driver.get("https://account.f5.com/myf5")
+
+    driver.implicitly_wait(10)
+
+    # dismiss cookie banner
+    driver.find_element(by=By.CSS_SELECTOR, value="#truste-consent-required").click()
+
+    # send username
+    driver.find_element(by=By.CSS_SELECTOR, value="#idp-discovery-username").send_keys(
+        myf5_username
+    )
+    driver.find_element(by=By.CSS_SELECTOR, value="#idp-discovery-submit").click()
+
+    # send password
+    driver.find_element(by=By.CSS_SELECTOR, value="#okta-signin-password").send_keys(
+        myf5_password
+    )
+    driver.find_element(by=By.CSS_SELECTOR, value="#okta-signin-submit").click()
+
+    # send totp
+    driver.find_element(by=By.CSS_SELECTOR, value="#input38").send_keys(myf5_totp.now())
+    driver.find_element(
+        by=By.XPATH,
+        value="input[@type-'tel']",
+    ).click()
+
+    # browse to downloads
+    driver.get("https://my.f5.com/manage/s/downloads")
+
+    # dismiss cookie banner
+    driver.find_element(by=By.CSS_SELECTOR, value="#truste-consent-required").click()
+
+    # accept license agreement
+    # check checkbox
+    driver.find_element(
+        by=By.XPATH,
+        value="span[@class='checkbox-label']",
+    ).click()
+    # click submit
+    driver.find_element(
+        by=By.XPATH,
+        value="/html/body/div[3]/div[2]/div/div[2]/div/div/c-myf5-download/div/c-helper-button/button/span",
+    ).click()
+
+    driver.refresh()
+
+    # Select the product family in the combobox
+    select_element = driver.find_element(
+        by=By.XPATH,
+        value="//select[starts-with(@id, 'productFamily')]",
+    )
+    select = Select(select_element)
+    select.select_by_visible_text("BIG-IP")
+
+    # Select the product line in the combobox
+    select_element = driver.find_element(
+        by=By.XPATH,
+        value="//select[starts-with(@id, 'productLine')]",
+    )
+    select = Select(select_element)
+    select.select_by_value(f"big-ip_v{bigip_version.split('.')[0]}.x")
+
+    # Select the version in the combobox
+    select_element = driver.find_element(
+        by=By.XPATH,
+        value="//select[starts-with(@id, 'version')]",
+    )
+    select = Select(select_element)
+    select.select_by_visible_text(bigip_version)
+
+    # Browse to the appropriate download page
+    driver.get(
+        f"https://my.f5.com/manage/s/downloads?productFamily=BIG-IP&productLine=big-ip_v{bigip_version.split('.')[0]}.x&version={bigip_version}"
+    )
+
+    driver.find_element(
+        by=By.XPATH,
+        value="//button[starts-with(@data-name, 'GeoLocationUpdates_Pulse')]",
+    ).click()
+
+    # Select the GeoIP zip for download
+    driver.find_element(
+        by=By.XPATH,
+        value="//button[starts-with(@data-name, 'ip-geolocation-v2')]",
+    ).click()
+
+    # Select the URL from the region select combobox
+    select_element = driver.find_element(
+        by=By.XPATH,
+        value="//select[starts-with(@id, 'locations')]",
+    )
+    select = Select(select_element)
+    select.select_by_visible_text("IRELAND")
+    url = select.first_selected_option.get_attribute("value")
+
+    # Close the browser
+    driver.quit()
+
+    return url
+
+
+def download_and_extract_geoip_zip(url):
+    """
+    Download the GeoIP zip file and extract it to a temporary directory.
+    """
+    unzip_dir = tempfile.mkdtemp()
+    with tempfile.NamedTemporaryFile() as zip_file:
+        response = requests.get(url)
+        zip_file.write(response.content)
+
+        with zipfile.ZipFile(zip_file.name, "r") as zip_ref:
+            zip_ref.extractall(unzip_dir)
+    return unzip_dir
+
+
+def upload_and_install_geoip_files(host, username, unzip_dir, password=None):
+    """
+    Upload the GeoIP files to the BIG-IP via SSH and install them.
+    """
+    # Connect to the BIG-IP
+    ssh = paramiko.SSHClient()
+    ssh.load_system_host_keys()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(host, username=username)
+
+    # Upload the GeoIP files
+
+    # Upload the GeoIP files
+    scp = SCPClient(ssh.get_transport())
+
+    for file in glob(os.path.join(unzip_dir, "*.rpm")):
+        logging.info(f"Uploading {file}...")
+        scp.put(os.path.join(unzip_dir, file), "/shared/tmp/")
+        logging.info(f"Installing {file}...")
+        result = ssh.exec_command(f"geoip_update_data -f /shared/tmp/{file}")
+        logging.info(result[1].read().decode("utf-8"))
+
+    # Disconnect from the BIG-IP
+    ssh.close()
+
+
+if __name__ == "__main__":
+    global arguments
+    arguments = docopt(__doc__, version="bigip_geoip_updater 0.0.1")
+
+    logging.basicConfig(level=logging.INFO)
+    myf5_password = open(arguments["--myf5-password-file"], "r").read().strip()
+    myf5_totp = open(arguments["--myf5-totp-file"], "r").read().strip()
+    url = get_geoip_url(
+        myf5_username=arguments["--myf5-username"],
+        myf5_password=myf5_password,
+        myf5_totp=pyotp.TOTP(myf5_totp),
+        bigip_version=arguments["--bigip-version"],
+    )
+    logging.info(f"GeoIP URL: {url}")
+    unzip_dir = download_and_extract_geoip_zip(url)
+    logging.info(f"GeoIP files extracted to: {unzip_dir}")
+    upload_and_install_geoip_files(
+        host=arguments["--host"],
+        username=arguments["--username"],
+        password=arguments["--password"],
+        unzip_dir=unzip_dir,
+    )
+
+    # Delete the directory and all its contents recursively
+    shutil.rmtree(unzip_dir)
